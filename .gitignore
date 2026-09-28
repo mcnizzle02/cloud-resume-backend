@@ -1,0 +1,18 @@
+# Azure Functions local settings (contains connection strings)
+local.settings.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Environment files and secrets
+.env
+*.publishsettings
+
+# OS and editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
