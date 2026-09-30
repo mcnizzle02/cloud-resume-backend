@@ -12,7 +12,11 @@ import json
 import azure.functions as func
 import pytest
 from azure.core import MatchConditions
-from azure.core.exceptions import ResourceModifiedError
+from azure.core.exceptions import (
+    ResourceExistsError,
+    ResourceModifiedError,
+    ResourceNotFoundError,
+)
 from azure.data.tables import TableEntity
 
 import function_app
@@ -28,9 +32,14 @@ class FakeTableClient:
     conflicts: how many update attempts should fail as if another visitor
                changed the counter first (simulates a race condition).
     count:     starting value, or None to simulate an entity with no count.
+    exists:    False simulates a brand-new, empty table.
+    create_race: True simulates another visitor creating the counter between
+               our failed read and our create.
     """
 
-    def __init__(self, count=0, conflicts=0):
+    def __init__(self, count=0, conflicts=0, exists=True, create_race=False):
+        self.exists = exists
+        self.create_race = create_race
         self.count = count
         self.etag = "etag-0"
         self.conflicts_remaining = conflicts
@@ -39,12 +48,23 @@ class FakeTableClient:
 
     def get_entity(self, partition_key, row_key):
         self.get_calls += 1
+        if not self.exists:
+            raise ResourceNotFoundError("The specified resource does not exist")
         data = {"PartitionKey": partition_key, "RowKey": row_key}
         if self.count is not None:
             data["count"] = self.count
         entity = TableEntity(**data)
         entity._metadata = {"etag": self.etag}  # real entities carry their ETag here
         return entity
+
+    def create_entity(self, entity):
+        if self.exists or self.create_race:
+            # Either it already existed, or someone else just created it.
+            self.exists = True
+            self.count = 1
+            raise ResourceExistsError("The specified entity already exists")
+        self.exists = True
+        self.count = entity["count"]
 
     def update_entity(self, entity, mode, etag, match_condition):
         self.update_calls.append({"etag": etag, "match_condition": match_condition})
@@ -89,6 +109,20 @@ def test_increments_existing_value():
 def test_entity_without_count_starts_at_one():
     table = FakeTableClient(count=None)
     assert function_app.increment_count(table) == 1
+
+
+def test_creates_counter_on_first_visit_to_empty_table():
+    """A freshly deployed database has the table but no counter entity yet."""
+    table = FakeTableClient(exists=False)
+    assert function_app.increment_count(table) == 1
+    assert table.count == 1
+
+
+def test_two_first_visitors_both_get_counted():
+    """If someone else creates the counter first, we still add our visit."""
+    table = FakeTableClient(exists=False, create_race=True)
+    assert function_app.increment_count(table) == 2
+    assert table.count == 2
 
 
 def test_update_is_conditional_on_etag():

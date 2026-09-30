@@ -9,7 +9,11 @@ import os
 
 import azure.functions as func
 from azure.core import MatchConditions
-from azure.core.exceptions import ResourceModifiedError
+from azure.core.exceptions import (
+    ResourceExistsError,
+    ResourceModifiedError,
+    ResourceNotFoundError,
+)
 from azure.data.tables import TableClient, UpdateMode
 
 # Anonymous because the browser calls this directly. A function key embedded in
@@ -36,13 +40,29 @@ def get_table_client() -> TableClient:
 def increment_count(table_client) -> int:
     """Read the counter, add one, and write it back safely.
 
+    If the counter doesn't exist yet, it is created with a value of 1.
+
     Uses the entity's ETag for optimistic concurrency: the write only succeeds
     if nobody else changed the counter since we read it. If two visitors hit
     the site at the same moment, the loser of the race re-reads and retries
     instead of overwriting the other visit.
     """
     for attempt in range(1, MAX_RETRIES + 1):
-        entity = table_client.get_entity(partition_key=PARTITION_KEY, row_key=ROW_KEY)
+        try:
+            entity = table_client.get_entity(partition_key=PARTITION_KEY, row_key=ROW_KEY)
+        except ResourceNotFoundError:
+            # First visit on a freshly deployed database: create the counter.
+            # Infrastructure as code builds the table, but not the data in it.
+            try:
+                table_client.create_entity(
+                    {"PartitionKey": PARTITION_KEY, "RowKey": ROW_KEY, "count": 1}
+                )
+                return 1
+            except ResourceExistsError:
+                # Another visitor created it a moment before us; go back and
+                # increment it through the normal path instead.
+                continue
+
         entity["count"] = int(entity.get("count", 0)) + 1
         try:
             table_client.update_entity(
