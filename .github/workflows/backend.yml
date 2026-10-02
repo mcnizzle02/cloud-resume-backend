@@ -1,0 +1,125 @@
+# Cloud Resume Challenge - backend CI/CD (step 14)
+#
+# Pull requests: run the tests only (no access to Azure).
+# Push to main:  run the tests, and only if they pass, deploy the Bicep
+#                infrastructure and publish the function code.
+#
+# Authentication uses OpenID Connect (OIDC): GitHub proves the workflow's
+# identity to Entra ID with a short-lived token. No Azure secret is stored
+# in this repo or in GitHub.
+
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "api/**"
+      - "infra/**"
+      - ".github/workflows/backend.yml"
+  pull_request:
+    branches: [main]
+  workflow_dispatch: # lets you run it manually from the Actions tab
+
+# Least privilege for the workflow's own GitHub token: read the code, nothing else.
+permissions:
+  contents: read
+
+# Never run two deployments to production at the same time.
+concurrency:
+  group: backend-production
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  RESOURCE_GROUP: rg-cloud-resume
+  LOCATION: eastus
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run pytest
+        run: pytest -v
+
+  deploy:
+    name: Deploy to Azure
+    needs: test # only runs if every test passed
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # allows this job to request an OIDC token for Azure
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Sign in to Azure (OIDC, no secrets)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Preview infrastructure changes (what-if)
+        run: |
+          az deployment group what-if \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infra/main.bicep \
+            --parameters location="$LOCATION"
+
+      - name: Deploy infrastructure (Bicep)
+        id: infra
+        run: |
+          FUNCTION_APP=$(az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "backend-${{ github.run_number }}" \
+            --template-file infra/main.bicep \
+            --parameters location="$LOCATION" \
+            --query properties.outputs.functionAppName.value \
+            --output tsv)
+          echo "function_app=$FUNCTION_APP" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Azure Functions Core Tools
+        run: npm install -g azure-functions-core-tools@4 --unsafe-perm true
+
+      - name: Publish function code
+        working-directory: api
+        run: func azure functionapp publish "${{ steps.infra.outputs.function_app }}" --python
+
+      - name: Smoke test the live API
+        run: |
+          URL=$(az deployment group show \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "backend-${{ github.run_number }}" \
+            --query properties.outputs.apiUrl.value \
+            --output tsv)
+          for attempt in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+              -H "Origin: https://leemcnutt.dev" "$URL")
+            echo "Attempt $attempt: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then exit 0; fi
+            sleep 15
+          done
+          echo "API did not return 200 after deployment"
+          exit 1
